@@ -37,7 +37,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-
+#include <time.h>
+#include <string.h>
 
 #include "rabin_polynomial.h"
 #include "rabin_polynomial_constants.h"
@@ -57,6 +58,14 @@ uint64_t *polynomial_lookup_buf;
 
 static int initialize_rabin_polynomial(uint64_t prime, unsigned max_size, unsigned int min_size, unsigned int average_block_size);
 
+uint64_t total_delta_bytes = 0;
+uint64_t total_read_bytes = 0;
+uint64_t total_compress_bytes = 0;
+uint64_t total_duplicate_bytes = 0;
+
+uint64_t features[12] = {0};
+uint64_t super_features[3] = {0};
+uint64_t hash_of_fp[12] = {0};
 /**
  * Prints the list of rabin polynomials to the given file
  */
@@ -79,7 +88,7 @@ void print_rabin_poly_to_file(FILE *out_file, struct rabin_polynomial *poly, int
   if (poly == NULL)
     return;
 
-  fprintf(out_file, "%llu,%u %llu", poly->start, poly->length, poly->polynomial);
+  fprintf(out_file, "%lu,%u %lu", poly->start, poly->length, poly->polynomial);
 
   if (new_line)
     fprintf(out_file, "\n");
@@ -230,7 +239,7 @@ void free_rabin_fingerprint_list(struct rabin_polynomial *head)
  * Gets the list of fingerprints from the given file
  */
 
-struct rabin_polynomial *get_file_rabin_polys(FILE *file_to_read) {
+struct rabin_polynomial *get_file_rabin_polys(FILE *file_to_read, const char* target, struct table_of_chunks* table) {
   initialize_rabin_polynomial_defaults();
 
   struct rab_block_info *block = NULL;
@@ -244,9 +253,14 @@ struct rabin_polynomial *get_file_rabin_polys(FILE *file_to_read) {
   ssize_t bytes_read = fread(file_data, 1, RAB_FILE_READ_BUF_SIZE, file_to_read);
 
   while (bytes_read != 0) {
-    block = read_rabin_block(file_data, bytes_read, block, NULL, NULL);
+    total_read_bytes += bytes_read;
+    block = read_rabin_block(file_data, bytes_read, block, NULL, NULL, target, table);
     bytes_read = fread(file_data, 1, RAB_FILE_READ_BUF_SIZE, file_to_read);
   }
+
+  /*
+   *deal with the last chunk of file
+   */
 
   if (block) {
     free(file_data);
@@ -300,7 +314,7 @@ struct rab_block_info *init_empty_block() {
  * Since most of the time we will not end on a border, the function returns
  * a block struct, which keeps track of the current blocksum and rolling checksum
  */
-struct rab_block_info *read_rabin_block(void *buf, ssize_t size, struct rab_block_info *cur_block, block_reached_func callback, void* user) {
+struct rab_block_info *read_rabin_block(void *buf, ssize_t size, struct rab_block_info *cur_block, block_reached_func callback, void* user, const char* target, struct table_of_chunks* table) {
   struct rab_block_info *block;
 
   if (cur_block == NULL) {
@@ -313,13 +327,17 @@ struct rab_block_info *read_rabin_block(void *buf, ssize_t size, struct rab_bloc
 
   ssize_t i;
   for (i = 0; i < size; i++) {
-    char cur_byte = *((char *)(buf + i));
+    char cur_byte = *((char *)buf + i);
     char pushed_out = block->current_window_data[block->window_pos];
     block->current_window_data[block->window_pos] = cur_byte;
     block->cur_roll_checksum = (block->cur_roll_checksum * rabin_polynomial_prime) + cur_byte;
     block->tail->polynomial = (block->tail->polynomial * rabin_polynomial_prime) + cur_byte;
     block->cur_roll_checksum -= (pushed_out * polynomial_lookup_buf[rabin_sliding_window_size]);
-
+    
+	//calculate features with cur_roll_checksum
+    uint64_t cur_feature = block->cur_roll_checksum ;
+    calculate_features(cur_feature, features, hash_of_fp);
+    
     block->window_pos++;
     block->total_bytes_read++;
     block->tail->length++;
@@ -330,18 +348,63 @@ struct rab_block_info *read_rabin_block(void *buf, ssize_t size, struct rab_bloc
     //If we hit our special value or reached the max win size create a new block
     if ((block->tail->length >= rabin_polynomial_min_block_size && (block->cur_roll_checksum % rabin_polynomial_average_block_size) == rabin_polynomial_prime) || block->tail->length == rabin_polynomial_max_block_size) {
       block->tail->start = block->total_bytes_read - block->tail->length;
-      if (callback != NULL) {
-        /* printf("callback i %d start %lld length %d end %lld\n", 
-                i, 
-                block->tail->start, 
-                block->tail->length, 
-                block->tail->start + block->tail->length - 1);
-        */
-        callback(block->tail, user);
+ 
+      calculate_super_features(super_features,features);
+      char* buffer = (char*)malloc(sizeof(char) * (block->tail->length));
+      memcpy(buffer, (char*)(buf + i), block->tail->length);
+        
+      uint64_t fp = get_fp_of_block(buffer, block->tail->length);
+ 
+	  struct chunk* cur_chunk = NULL;
+	  cur_chunk = insert_fingerprint_in_table(table, fp, super_features, block->tail->length);
+	  if(cur_chunk != NULL)
+      {
+        struct chunk* similar_chunk = NULL; 
+		similar_chunk = find_similar_chunk(table, fp, super_features);
+        if(similar_chunk != NULL)
+        {  
+            /*
+             *find similar chunk, get its data of chunk, and compress it
+             */
+            char *ref = get_chunk_from_file(ref, similar_chunk, target);         
+			unsigned char *delta = NULL;
+            uint64_t len_of_delta = 0;
+            zd_compress(ref, similar_chunk->length, buffer, block->tail->length, delta, &len_of_delta); 
+            total_delta_bytes += len_of_delta;
+            total_compress_bytes += block->tail->length - len_of_delta;
+            cur_chunk->length = len_of_delta;
+            /*
+             *write difference to file
+             */
+            write_chunk_to_file(delta, len_of_delta, cur_chunk, target);
+            if(delta != NULL)
+                free(delta);
+            free(ref);
+        }
+        else// not find similar chunk and insert it directly
+        {
+            write_chunk_to_file(buffer, block->tail->length, cur_chunk, target);
+        }
+      }
+      else
+      {
+         total_duplicate_bytes += block->tail->length;
       }
       struct rabin_polynomial *new_poly = gen_new_polynomial(NULL, 0, 0, 0);
       block->tail->next_polynomial = new_poly;
       block->tail = new_poly;
+      /*
+       *test code
+       */
+      printf("total_read_bytes: %lu\n", total_read_bytes);
+      printf("total_compress_bytes: %lu\n", total_compress_bytes);
+      printf("total_delta_bytes: %lu\n", total_delta_bytes);
+      printf("total_duplicate_bytes: %lu\n\n", total_duplicate_bytes);
+      
+      free(buffer);
+      memset(super_features, 0, sizeof(super_features));
+      memset(features, 0, sizeof(features));
+      memset(hash_of_fp, 0, sizeof(hash_of_fp));
 
       if (i == size - 1)
         block->current_poly_finished = 1;
@@ -349,18 +412,15 @@ struct rab_block_info *read_rabin_block(void *buf, ssize_t size, struct rab_bloc
   }
   block->tail->start = block->total_bytes_read - block->tail->length;
 
-  // printf("size %d\n", size);
-  // printf("total_bytes_read %lld\n", block->total_bytes_read);
-  // printf("current_poly_finished %d\n", block->current_poly_finished);
-  
-  //We ended on a border, gen a new tail
   if (block->current_poly_finished) {
       struct rabin_polynomial *new_poly = gen_new_polynomial(NULL, 0, 0, 0);
       block->tail->next_polynomial = new_poly;
       block->tail = new_poly;
       block->current_poly_finished = 0;
   }
-
+ 
   return block;
 }
+
+	
 
