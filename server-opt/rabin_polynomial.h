@@ -1,5 +1,15 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "SHA-256.h"
+#include "hashtable.h"
+#include "zdlib.h"
+#include "zd_mem.h"
+#include "zutil.h"
+#include "function.h"
 
 #ifdef __APPLE__
 #include <unistd.h>
@@ -15,6 +25,10 @@ extern unsigned int rabin_polynomial_max_block_size;
 extern unsigned int rabin_polynomial_min_block_size;
 
 extern unsigned int rabin_polynomial_average_block_size;
+
+extern uint32_t INITIALIZE;
+
+extern struct table_of_chunks* table ;
 
 
 /**
@@ -49,7 +63,7 @@ struct rab_block_info {
 typedef void (*block_reached_func)(struct rabin_polynomial* result, void* user);
 
 int initialize_rabin_polynomial_defaults();
-struct rab_block_info *read_rabin_block(void *buf, ssize_t size, struct rab_block_info *cur_block, block_reached_func callback, void* user);
+struct rab_block_info *read_rabin_block(void *buf, ssize_t size, struct rab_block_info *cur_block, block_reached_func callback, void* user, const char* target, struct table_of_chunks* table);
 
 void change_average_rabin_block_size(int increment_mode);
 int write_rabin_fingerprints_to_binary_file(FILE *file, struct rabin_polynomial *head);
@@ -60,7 +74,7 @@ struct rabin_polynomial *gen_new_polynomial(struct rabin_polynomial *tail, uint6
 
 void print_rabin_poly_to_file(FILE *out_file, struct rabin_polynomial *poly, int new_line);
 void print_rabin_poly_list_to_file(FILE *out_file, struct rabin_polynomial *poly);
-struct rabin_polynomial *get_file_rabin_polys(FILE *file_to_read);
+struct rabin_polynomial *get_file_rabin_polys(FILE *file_to_read, const char* target, struct table_of_chunks* table);
 
 #endif
 
